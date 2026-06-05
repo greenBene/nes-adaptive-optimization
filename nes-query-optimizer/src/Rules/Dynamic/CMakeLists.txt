@@ -11,10 +11,5 @@
 # limitations under the License.
 
 add_source_files(nes-query-optimizer
-        PlanRuleRegistry.cpp
+        StrawmanDynamicRule.cpp
 )
-
-add_subdirectory(Barriers)
-add_subdirectory(Semantic)
-add_subdirectory(Static)
-add_subdirectory(Dynamic)
