@@ -75,7 +75,6 @@ SingleNodeWorker::SingleNodeWorker(const SingleNodeWorkerConfiguration& configur
 
     nodeEngine = NodeEngineBuilder(configuration.workerConfiguration, copyPtr(listener)).build(host);
     compiler = std::make_unique<QueryCompilation::QueryCompiler>(configuration.workerConfiguration.defaultQueryExecution);
-    localQueryCatalog.clear();
     adaptiveOptimizer = std::make_unique<AdaptiveOptimizer>();
     localStatisticsCatalog = std::make_shared<LocalStatisticsCatalog>();
 
@@ -126,7 +125,7 @@ std::expected<QueryId, Exception> SingleNodeWorker::startQuery(LogicalPlan plan)
         auto result = compiler->compileQuery(std::move(request));
         INVARIANT(result, "expected successful query compilation or exception, but got nothing");
         nodeEngine->startQuery(plan.getQueryId(), std::move(result));
-        localQueryCatalog.emplace(plan.getQueryId(), plan);
+        localQueryCatalog.addQuery(plan.getQueryId(), plan);
         return plan.getQueryId();
     }
     CPPTRACE_CATCH(...)
@@ -142,7 +141,7 @@ std::expected<void, Exception> SingleNodeWorker::stopQuery(QueryId queryId) noex
     {
         PRECONDITION(queryId != INVALID_QUERY_ID, "QueryId must be not invalid!");
         nodeEngine->stopQuery(queryId);
-        localQueryCatalog.erase(queryId);
+        localQueryCatalog.removeQuery(queryId);
         return {};
     }
     CPPTRACE_CATCH(...)
@@ -154,8 +153,10 @@ std::expected<void, Exception> SingleNodeWorker::stopQuery(QueryId queryId) noex
 
 std::expected<void, Exception> SingleNodeWorker::adaptiveOptimization() noexcept
 {
-    for (auto& plan : localQueryCatalog | std::views::values)
+    for (const auto& id : localQueryCatalog.getAllQueryIds())
     {
+        auto plan = localQueryCatalog.getLogicalPlan(id).value();
+
         auto result = adaptiveOptimizer->reoptimize(plan, *localStatisticsCatalog);
 
         if (!result.has_value())
@@ -165,36 +166,30 @@ std::expected<void, Exception> SingleNodeWorker::adaptiveOptimization() noexcept
         auto request = std::make_unique<QueryCompilation::QueryCompilationRequest>(result.value());
         auto compiled = compiler->compileQuery(std::move(request));
         nodeEngine->replaceQueryPlan(std::move(compiled));
-        plan = result.value();
+        localQueryCatalog.updateQuery(id, result.value());
     }
 
     return {};
 }
 
 std::expected<void, Exception>
-SingleNodeWorker::updateStatistics(std::string localQueryId, std::string distributedQueryId, uint64_t operatorId, int64_t value) noexcept
+SingleNodeWorker::updateStatistics(std::string localQueryIdPrefix, uint64_t operatorId, int64_t value) noexcept
 {
     CPPTRACE_TRY
     {
-        NES_INFO(
-            "UpdateStatistics request localQueryId: {}, distributedQueryId: {}, operatorId: {}, value: {}",
-            localQueryId,
-            distributedQueryId,
-            operatorId,
-            value);
+        NES_INFO("UpdateStatistics request localQueryIdPrefix: {}, operatorId: {}, value: {}", localQueryIdPrefix, operatorId, value);
 
-        LocalQueryId lqi{localQueryId};
-        DistributedQueryId dqi{distributedQueryId};
 
-        auto queryId = QueryId::create(lqi, dqi);
+        auto result = localQueryCatalog.getLogicalPlan(localQueryIdPrefix);
 
-        if (localQueryCatalog.contains(queryId))
+
+        if (result.has_value())
         {
-            localStatisticsCatalog->setOperatorStatistics(queryId, OperatorId{operatorId}, value);
+            localStatisticsCatalog->setOperatorStatistics(result.value().getQueryId(), OperatorId{operatorId}, value);
         }
         else
         {
-            NES_DEBUG("No local query of id {} available", queryId);
+            NES_DEBUG("Could not detect query with prefix {}: {}", localQueryIdPrefix, result.error());
         }
     }
     CPPTRACE_CATCH(...)
